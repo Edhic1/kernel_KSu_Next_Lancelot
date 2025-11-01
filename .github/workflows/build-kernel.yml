@@ -45,7 +45,7 @@ jobs:
           set -euo pipefail
           targets=()
           if [[ "${{ github.event.inputs.build_ksun }}" == "true" ]]; then targets+=("ksun"); fi
-            if [[ "${{ github.event.inputs.build_ksun_old }}" == "true" ]]; then targets+=("ksun-old"); fi
+          if [[ "${{ github.event.inputs.build_ksun_old }}" == "true" ]]; then targets+=("ksun-old"); fi
           if [[ "${{ github.event.inputs.build_suki }}" == "true" ]]; then targets+=("suki"); fi
           if [[ "${{ github.event.inputs.build_suki_old }}" == "true" ]]; then targets+=("suki-old"); fi
 
@@ -148,7 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace"
-          wget -nv -O clang.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-aarch64-linux-gnu.tar.xz
+          wget -nv -O clang.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz
           mkdir clang
           tar -C clang/ -Jxvf clang.tar.xz --strip-components=1
           rm clang.tar.xz
@@ -380,6 +380,15 @@ jobs:
           else
             echo "Toolchain not selected"; exit 1
           fi
+          
+          # Build the kernel
+          if [[ "${{ env.ENABLE_CCACHE }}" == "true" ]]; then
+            export USE_CCACHE=1
+            export CCACHE_EXEC=$(which ccache)
+          fi
+          
+          make ARCH=${{ env.KERNEL_ARCH }} O=out "${DEVICE}_defconfig"
+          make ARCH=${{ env.KERNEL_ARCH }} O=out ${{ env.EXTRA_CMDS }} -j$(nproc)
 
       - name: Check a kernel output files
         shell: bash
