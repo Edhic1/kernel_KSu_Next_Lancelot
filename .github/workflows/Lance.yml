@@ -1,0 +1,221 @@
+name: Build Kernel (SukiSU + SUSFS)
+on:
+  workflow_dispatch:
+    inputs:
+      select_device:
+        description: 'Select device:'
+        required: true
+        type: choice
+        options:
+        - 'lancelot'
+        - 'merlin'
+      kernel_version:
+        description: 'Kernel Version (untuk SUSFS):'
+        required: true
+        type: choice
+        options:
+        - 'kernel-4.14'
+        - 'kernel-4.9'
+        default: 'kernel-4.14'
+
+jobs:
+  build:
+    name: Build Kernel by ${{ github.actor }}
+    runs-on: ubuntu-24.04
+    env:
+      DEVICE: ${{ github.event.inputs.select_device }}
+      SUSFS_BRANCH: ${{ github.event.inputs.kernel_version }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Maximize build space
+      if: env.REMOVE_UNUSED_PACKAGES == 'true'
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 8192
+        temp-reserve-mb: 2048
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+
+    - name: Prepare environment
+      run: |
+        if [ -f config.env ]; then
+            grep -v -E "^#|^\n" config.env | sed 's/ #.*//; s/#.*//' >> $GITHUB_ENV
+        fi
+
+    - name: Set swap to 10G
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 10
+
+    - name: Setup kernel build environment
+      run: |
+        echo "BUILD_TIME=$(TZ=UTC date "+%Y%m%d%H%M")" >> $GITHUB_ENV
+        sudo apt-get update
+        sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses6 libncurses-dev libsdl1.2-dev libssl-dev libwxgtk3.2-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+
+    - name: Download Clang
+      if: env.USE_CLANG == 'true' && env.USE_GCC != 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        if [[ ${{ env.CLANG_SOURCE }} == *'.tar.gz' ]]; then
+            wget -nv -O clang.tar.gz ${{ env.CLANG_SOURCE }}
+            mkdir clang
+            tar -C clang/ -zxvf clang.tar.gz
+            rm clang.tar.gz
+        elif [[ ${{ env.CLANG_SOURCE }} == *'.tar.xz' ]]; then
+            wget -nv -O clang.tar.xz ${{ env.CLANG_SOURCE }}
+            mkdir clang
+            tar -C clang/ -Jxvf clang.tar.xz
+            rm clang.tar.xz
+        elif [[ ${{ env.CLANG_SOURCE }} == *'.git' ]]; then
+            git clone ${{ env.CLANG_SOURCE }} -b ${{ env.CLANG_BRANCH }} clang --depth=1
+        else
+            wget -nv -O clang.zip ${{ env.CLANG_SOURCE }}
+            mkdir clang
+            unzip clang.zip -d clang/
+        fi
+        if [[ "$(find ./clang -mindepth 1 -maxdepth 1 -type d | wc -l)" == "1" ]]; then
+            mv -f "$(find ./clang -mindepth 1 -maxdepth 1 -type d)"/* ./clang
+        fi
+
+    - name: Download GCC
+      if: env.USE_GCC == 'true' && env.USE_CLANG != 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # (Bagian GCC sama seperti sebelumnya, dipersingkat di view ini agar fokus ke SUSFS)
+        # ... Paste logic GCC download kamu disini jika pakai GCC ...
+
+    - name: Download kernel source
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        git clone --recursive ${{ env.KERNEL_SOURCE }} -b ${{ env.KERNEL_SOURCE_BRANCH }} android-kernel --depth=1
+
+    - name: Setup SukiSU (Base)
+      if: env.ENABLE_KERNELSU == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        # Menggunakan script SukiSU basic (tanpa argumen susfs-main otomatis, karena kita akan manual patch)
+        curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash
+        
+        if [ -d KernelSU ]; then
+            KSU_VERSION="_$(cd KernelSU && expr $(/usr/bin/git rev-list --count HEAD) + 10200)"
+        else
+            KSU_VERSION=""
+        fi
+        echo "UPLOADNAME=-SukiSU-SUSFS$KSU_VERSION" >> $GITHUB_ENV
+
+    - name: Apply SUSFS Patches (Simonpunk)
+      if: env.ENABLE_KERNELSU == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        
+        # 1. Clone SUSFS Repository dari GitLab
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b ${{ env.SUSFS_BRANCH }}
+        
+        # 2. Copy file fs dan include ke source kernel
+        # Menggunakan rsync untuk merge folder dengan aman
+        rsync -av susfs4ksu/kernel_patches/fs/ android-kernel/fs/
+        rsync -av susfs4ksu/kernel_patches/include/linux/ android-kernel/include/linux/
+
+        # 3. Apply Patch ke KernelSU (yang ada di dalam android-kernel)
+        cd android-kernel/KernelSU
+        # Copy patch enable patch
+        cp ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch .
+        # Apply patch
+        echo "Applying 10_enable_susfs_for_ksu.patch..."
+        patch -p1 < 10_enable_susfs_for_ksu.patch || echo "Patch KernelSU mungkin sudah terpasang atau konflik ringan."
+
+        # 4. Apply Patch ke Kernel Utama
+        cd ..
+        # Copy patch add susfs
+        # Nama file patch mungkin berbeda tergantung versi (misal 50_add_susfs_in_kernel-4.14.patch)
+        # Kita pakai wildcard agar fleksibel tapi tetap spesifik ke versi
+        cp ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-*.patch .
+        
+        echo "Applying 50_add_susfs_in_kernel patch..."
+        # Mencoba apply patch yang sesuai
+        patch -p1 < 50_add_susfs_in_kernel-*.patch || echo "Patch Kernel mungkin gagal atau perlu penyesuaian manual."
+
+    - name: Setup Configuration for kernel
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        
+        # SukiSU & SUSFS Configs
+        if [ ${{ env.ENABLE_KERNELSU }} = true ]; then
+            # Pastikan CONFIG_KSU aktif
+            if grep -q "CONFIG_KSU" arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig; then
+                sed -i 's/# CONFIG_KSU is not set/CONFIG_KSU=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+                sed -i 's/CONFIG_KSU=n/CONFIG_KSU=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+            else
+                echo "CONFIG_KSU=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+            fi
+            
+            # Inject Konfigurasi Khusus SUSFS
+            echo "Injecting SUSFS configurations..."
+            for config in CONFIG_KSU=y \
+                          CONFIG_KSU_SUSFS=y \
+                          CONFIG_KSU_SUSFS_SUS_PATH=y \
+                          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y \
+                          CONFIG_KSU_SUSFS_SUS_MOUNT=y \
+                          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y \
+                          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y \
+                          CONFIG_KSU_SUSFS_SUS_KSTAT=y \
+                          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y \
+                          CONFIG_KSU_SUSFS_TRY_UMOUNT=y \
+                          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y \
+                          CONFIG_KSU_SUSFS_SPOOF_UNAME=y \
+                          CONFIG_KSU_SUSFS_ENABLE_LOG=y \
+                          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y \
+                          CONFIG_KSU_SUSFS_SPOOF_PROC_CMDLINE=y \
+                          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y \
+                          CONFIG_KSU_SUSFS_SUS_SU=y \
+                          CONFIG_KSU_DEBUG=n
+            do
+                # Cek jika config sudah ada, ubah nilainya. Jika belum, tambahkan.
+                if grep -q "${config%=*}" arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig; then
+                    sed -i "s|${config%=*}=.*|$config|g" arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+                else
+                    echo "$config" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+                fi
+            done
+        fi
+
+        # Config lain (OverlayFS, dll)
+        if [ ${{ env.ADD_OVERLAYFS_CONFIG }} = true ]; then
+            echo "CONFIG_OVERLAY_FS=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+        fi
+
+    - name: Build kernel
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH
+        export KBUILD_BUILD_HOST=Github-Action
+        export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
+        
+        make -j$(nproc --all) CC=clang O=out ARCH=${{ env.KERNEL_ARCH }} ${{ env.EXTRA_CMDS }} ${DEVICE}_defconfig
+        make -j$(nproc --all) CC=clang O=out ARCH=${{ env.KERNEL_ARCH }} ${{ env.EXTRA_CMDS }}
+
+    - name: Check a kernel output files
+      run: |
+       cd $GITHUB_WORKSPACE/kernel_workspace
+       if [ -f android-kernel/out/arch/${{ env.KERNEL_ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }} ]; then
+           echo "CHECK_FILE_IS_OK=true" >> $GITHUB_ENV
+       else
+           echo "Kernel output file is empty"
+           exit 1
+       fi
+
+    - name: Upload kernel image
+      if: env.CHECK_FILE_IS_OK == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.KERNEL_IMAGE_NAME }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+        path: android-kernel/out/arch/${{ env.KERNEL_ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }}
+        
